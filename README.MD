@@ -56,6 +56,7 @@ Replace `<PORT>` with the real port number (example: `8080`).
 | `CONSUL_ADDR` | `consul:8500` | Where to send API calls. |
 | `HOST_IP` | auto | Fixed host IP if auto guess is wrong. |
 | `DEBUG` | unset | Set to `1` to print HTTP calls. |
+| `CONSUL_SKIP_VERIFY` | `1` | Skip TLS cert check (same as flag `--insecure`). |
 
 ---
 

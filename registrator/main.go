@@ -1,451 +1,763 @@
 package main
 
 import (
-    "bytes"
-    "context"
-    "encoding/json"
-    "errors"
-    "fmt"
-    "io"
-    "log"
-    "net"
-    "net/http"
-    "os"
-    "strconv"
-    "strings"
-    "sync"
-    "time"
+	"bytes"
+	"context"
+	"crypto/tls"
+	"encoding/json"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"log"
+	"math/rand"
+	"net"
+	"net/http"
+	"net/url"
+	"os"
+	"os/signal"
+	"strconv"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
 
-    "github.com/docker/docker/api/types"
-    "github.com/docker/docker/api/types/container"
-    "github.com/docker/docker/api/types/events"
-    "github.com/docker/docker/api/types/filters"
-    "github.com/docker/docker/client"
+	"github.com/docker/docker/api/types"
+	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/events"
+	"github.com/docker/docker/api/types/filters"
+	"github.com/docker/docker/client"
 )
 
 var debug = os.Getenv("DEBUG") == "1"
 
-// Service describes a Consul service
-// -----------------------------------------------------------------------------
+func init() { rand.Seed(time.Now().UnixNano()) }
+
+// ----------------------------------------------------------------------
+// Service
+// ----------------------------------------------------------------------
+
 type Service struct {
-    ID, Name        string
-    IP              string
-    Port            int
-    Tags            []string
-    HTTPPath        string
-    TCP             bool
-    TTL             string
-    Interval        string
-    Timeout         string
-    DeregAfter      string
-    ttlValid        bool
+	ID, Name   string
+	IP         string
+	Port       int
+	Tags       []string
+	HTTPPath   string
+	TCPCheck   bool
+	TTL        string
+	Interval   string
+	Timeout    string
+	DeregAfter string
+	ttlValid   bool
 }
 
-// Backend manages Consul registration
-// -----------------------------------------------------------------------------
+// ----------------------------------------------------------------------
+// Consul backend
+// ----------------------------------------------------------------------
+
 type Backend interface {
-    Register(*Service) error
-    Deregister(*Service) error
-    PassTTL(*Service) error
+	Register(*Service) error
+	Deregister(*Service) error
+	PassTTL(*Service) error
 }
 
 type consulBackend struct {
-    addr   string
-    client *http.Client
+	addr   string
+	client *http.Client
+	scheme string
 }
 
-func newConsulBackend(addr string) *consulBackend {
-    if addr == "" {
-        addr = "consul:8500"
-    }
-    if !strings.HasPrefix(addr, "http") {
-        addr = "http://" + addr
-    }
-    return &consulBackend{addr: addr, client: &http.Client{Timeout: 5 * time.Second}}
+type httpBackoff struct{ min, max time.Duration }
+
+func (b httpBackoff) next(prev time.Duration) time.Duration {
+	if prev == 0 {
+		return b.min
+	}
+	d := prev * 2
+	if d > b.max {
+		d = b.max
+	}
+	jitter := d / 10
+	if jitter == 0 {
+		return d
+	}
+	return d - jitter + time.Duration(rand.Int63n(int64(2*jitter)))
 }
 
-func (c *consulBackend) put(path string, payload any) error {
-    var buf bytes.Buffer
-    if payload != nil {
-        if err := json.NewEncoder(&buf).Encode(payload); err != nil {
-            return err
-        }
-    }
-    if debug {
-        log.Printf("→ PUT %s%s (%d bytes)", c.addr, path, buf.Len())
-    }
-    req, _ := http.NewRequest(http.MethodPut, c.addr+path, &buf)
-    req.Header.Set("Content-Type", "application/json")
-    resp, err := c.client.Do(req)
-    if err != nil {
-        return err
-    }
-    defer resp.Body.Close()
-    if resp.StatusCode >= 300 {
-        msg, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-        return fmt.Errorf("%s: %s", resp.Status, strings.TrimSpace(string(msg)))
-    }
-    return nil
+func newConsulBackend(addr string, insecure bool) *consulBackend {
+	if addr == "" {
+		addr = "consul:8500"
+	}
+	scheme := "http://"
+	switch {
+	case strings.HasPrefix(addr, "https://"):
+		scheme = "https://"
+		addr = strings.TrimPrefix(addr, "https://")
+	case strings.HasPrefix(addr, "http://"):
+		addr = strings.TrimPrefix(addr, "http://")
+	}
+	addr = strings.TrimSuffix(addr, "/")
+
+	tr := &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: insecure}}
+	cl := &http.Client{
+		Timeout:       10 * time.Second,
+		Transport:     tr,
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse },
+	}
+	return &consulBackend{addr: addr, client: cl, scheme: scheme}
 }
 
-func (c *consulBackend) buildCheck(s *Service) map[string]string {
-    base := firstNonEmpty(s.DeregAfter, "1m")
-    switch {
-    case s.ttlValid:
-        return map[string]string{"TTL": s.TTL, "DeregisterCriticalServiceAfter": base}
-    case s.HTTPPath != "":
-        return map[string]string{
-            "HTTP": fmt.Sprintf("http://%s:%d%s", s.IP, s.Port, s.HTTPPath),
-            "Interval": firstNonEmpty(s.Interval, "10s"),
-            "Timeout": firstNonEmpty(s.Timeout, "2s"),
-            "DeregisterCriticalServiceAfter": base,
-        }
-    case s.TCP:
-        return map[string]string{
-            "TCP": fmt.Sprintf("%s:%d", s.IP, s.Port),
-            "Interval": firstNonEmpty(s.Interval, "10s"),
-            "Timeout": firstNonEmpty(s.Timeout, "2s"),
-            "DeregisterCriticalServiceAfter": base,
-        }
-    default:
-        return nil
-    }
+func (c *consulBackend) put(ctx context.Context, path string, payload any) error {
+	var data []byte
+	if payload != nil {
+		var err error
+		if data, err = json.Marshal(payload); err != nil {
+			return err
+		}
+	}
+
+	urlStr := c.scheme + c.addr + path
+	back := httpBackoff{min: 500 * time.Millisecond, max: 4 * time.Second}
+	var wait time.Duration
+
+	for attempt := 0; attempt < 3; attempt++ {
+		if debug {
+			log.Printf("→ PUT %s (%dB) attempt=%d", urlStr, len(data), attempt+1)
+		}
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodPut, urlStr, bytes.NewReader(data))
+		if err != nil {
+			return err
+		}
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := c.client.Do(req)
+		if err == nil {
+			if resp.StatusCode < 300 {
+				resp.Body.Close()
+				return nil
+			}
+			msg, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+			resp.Body.Close()
+			err = fmt.Errorf("%s: %s", resp.Status, strings.TrimSpace(string(msg)))
+		}
+
+		if attempt == 2 {
+			return err
+		}
+		wait = back.next(wait)
+		select {
+		case <-time.After(wait):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return nil
+}
+
+func (c *consulBackend) buildCheck(s *Service) map[string]any {
+	dereg := firstNonEmpty(s.DeregAfter, "1m")
+
+	switch {
+	case s.ttlValid:
+		return map[string]any{
+			"TTL":                            s.TTL,
+			"DeregisterCriticalServiceAfter": dereg,
+		}
+	case s.HTTPPath != "":
+		target := s.HTTPPath
+		if !strings.HasPrefix(target, "http") {
+			if !strings.HasPrefix(target, "/") {
+				target = "/" + target
+			}
+			target = fmt.Sprintf("http://%s:%d%s", s.IP, s.Port, target)
+		}
+		return map[string]any{
+			"HTTP":                           target,
+			"Interval":                       firstNonEmpty(s.Interval, "10s"),
+			"Timeout":                        firstNonEmpty(s.Timeout, "2s"),
+			"DeregisterCriticalServiceAfter": dereg,
+		}
+	case s.TCPCheck:
+		return map[string]any{
+			"TCP":                            fmt.Sprintf("%s:%d", s.IP, s.Port),
+			"Interval":                       firstNonEmpty(s.Interval, "10s"),
+			"Timeout":                        firstNonEmpty(s.Timeout, "2s"),
+			"DeregisterCriticalServiceAfter": dereg,
+		}
+	default:
+		return nil
+	}
 }
 
 func (c *consulBackend) Register(s *Service) error {
-    payload := map[string]any{
-        "ID":      s.ID,
-        "Name":    s.Name,
-        "Address": s.IP,
-        "Port":    s.Port,
-        "Tags":    s.Tags,
-    }
-    if chk := c.buildCheck(s); chk != nil {
-        payload["Check"] = chk
-    }
-    return c.put("/v1/agent/service/register", payload)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	payload := map[string]any{
+		"ID":      s.ID,
+		"Name":    s.Name,
+		"Address": s.IP,
+		"Port":    s.Port,
+		"Tags":    s.Tags,
+	}
+	if chk := c.buildCheck(s); chk != nil {
+		payload["Check"] = chk
+	}
+	return c.put(ctx, "/v1/agent/service/register", payload)
 }
 
 func (c *consulBackend) Deregister(s *Service) error {
-    return c.put("/v1/agent/service/deregister/"+s.ID, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	return c.put(ctx, "/v1/agent/service/deregister/"+url.PathEscape(s.ID), nil)
 }
 
 func (c *consulBackend) PassTTL(s *Service) error {
-    if !s.ttlValid {
-        return nil
-    }
-    return c.put("/v1/agent/check/pass/service:"+s.ID, nil)
+	if !s.ttlValid {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return c.put(ctx, "/v1/agent/check/pass/service:"+url.PathEscape(s.ID), nil)
 }
 
-// Bridge wires Docker events to Consul backend
-// -----------------------------------------------------------------------------
+// ----------------------------------------------------------------------
+// Bridge
+// ----------------------------------------------------------------------
+
+type regEntry struct {
+	services []*Service
+	cancel   context.CancelFunc
+	mu       sync.Mutex
+}
+
 type Bridge struct {
-    cli *client.Client
-    be  Backend
-    mu  sync.Mutex
-    reg map[string][]*Service
+	cli *client.Client
+	be  Backend
+
+	mu  sync.Mutex
+	reg map[string]*regEntry
+	wg  sync.WaitGroup
+
+	rootCtx context.Context
 }
 
 func newBridge(be Backend) (*Bridge, error) {
-    cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
-    if err != nil {
-        return nil, err
-    }
-    return &Bridge{cli: cli, be: be, reg: make(map[string][]*Service)}, nil
+	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	if err != nil {
+		return nil, err
+	}
+	return &Bridge{cli: cli, be: be, reg: make(map[string]*regEntry)}, nil
 }
 
+func (b *Bridge) Close() error { return b.cli.Close() }
+
 func (b *Bridge) Run(ctx context.Context) error {
-    // initial scan
-    list, _ := b.cli.ContainerList(ctx, container.ListOptions{})
-    for _, c := range list {
-        b.handleStart(ctx, c.ID)
-    }
-    // subscribe to events
-    f := filters.NewArgs()
-    f.Add("type", "container")
-    f.Add("event", "start")
-    f.Add("event", "die")
-    f.Add("event", "destroy")
-    msgs, errs := b.cli.Events(ctx, events.ListOptions{Filters: f})
-    for {
-        select {
-        case m := <-msgs:
-            if m.Action == "start" {
-                go b.handleStart(ctx, m.ID)
-            } else {
-                go b.handleStop(m.ID)
-            }
-        case err := <-errs:
-            return err
-        case <-ctx.Done():
-            return ctx.Err()
-        }
-    }
+	b.rootCtx = ctx
+
+	f := filters.NewArgs()
+	f.Add("type", "container")
+	for _, ev := range []string{"start", "die", "destroy", "stop", "kill"} {
+		f.Add("event", ev)
+	}
+
+	for {
+		evCtx, cancel := context.WithCancel(ctx)
+		msgs, errs := b.cli.Events(evCtx, events.ListOptions{Filters: f})
+
+		if err := b.initialScan(evCtx); err != nil {
+			cancel()
+			return err
+		}
+
+		if err := b.eventLoop(evCtx, msgs, errs); err != nil {
+			cancel()
+			if errors.Is(err, context.Canceled) {
+				b.wg.Wait()
+				return err
+			}
+			log.Printf("event stream error: %v – reconnecting in 2s", err)
+
+			b.mu.Lock()
+			for cid, entry := range b.reg {
+				entry.cancel()
+				delete(b.reg, cid)
+			}
+			b.mu.Unlock()
+
+			b.wg.Wait()
+			time.Sleep(2 * time.Second)
+			continue
+		}
+
+		cancel()
+		b.wg.Wait()
+		return nil
+	}
+}
+
+func (b *Bridge) initialScan(ctx context.Context) error {
+	list, err := b.cli.ContainerList(ctx, container.ListOptions{})
+	if err != nil {
+		return err
+	}
+	for _, c := range list {
+		b.mu.Lock()
+		_, exists := b.reg[c.ID]
+		b.mu.Unlock()
+		if exists {
+			continue
+		}
+		go b.handleStart(ctx, c.ID)
+	}
+	return nil
+}
+
+func (b *Bridge) eventLoop(ctx context.Context, msgs <-chan events.Message, errs <-chan error) error {
+	for {
+		select {
+		case m, ok := <-msgs:
+			if !ok {
+				return io.EOF
+			}
+			switch m.Action {
+			case "start":
+				go b.handleStart(ctx, m.ID)
+			case "die", "destroy", "stop", "kill":
+				go b.handleStop(m.ID)
+			}
+		case err, ok := <-errs:
+			if !ok {
+				return io.EOF
+			}
+			if err != nil {
+				return err
+			}
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 }
 
 func hasGlobalIgnore(env []string, labels map[string]string) bool {
-    for _, e := range env {
-        if e == "SERVICE_IGNORE=true" {
-            return true
-        }
-    }
-    if labels["SERVICE_IGNORE"] == "true" {
-        return true
-    }
-    return false
+	for _, e := range env {
+		if strings.HasPrefix(e, "SERVICE_IGNORE=") &&
+			strings.TrimSpace(strings.TrimPrefix(e, "SERVICE_IGNORE=")) == "true" {
+			return true
+		}
+	}
+	return labels["SERVICE_IGNORE"] == "true"
 }
 
-func (b *Bridge) handleStart(ctx context.Context, cid string) {
-    ins, err := b.cli.ContainerInspect(ctx, cid)
-    if err != nil {
-        log.Println("inspect error:", err)
-        return
-    }
-    if hasGlobalIgnore(ins.Config.Env, ins.Config.Labels) {
-        return
-    }
-    ip := firstHostIP()
-    // 1) ENV-style multi-port
-    svcs := parseEnv(ins.Config.Env, ip)
-    // 2) labels fallback single-port
-    if len(svcs) == 0 {
-        if s := parseLabels(&ins, ip); s != nil {
-            svcs = append(svcs, s)
-        }
-    }
-    // 3) container_name fallback when no NAME
-    for _, s := range svcs {
-        if strings.HasPrefix(s.ID, "registrator:svc-") {
-            name := strings.TrimPrefix(ins.Name, "/")
-            s.Name = name
-            s.ID = fmt.Sprintf("registrator:%s:%d", name, s.Port)
-        }
-    }
-    // register each
-    for _, s := range svcs {
-        validateTTL(s)
-        go b.registerRetry(ctx, cid, s)
-    }
+func (b *Bridge) handleStart(parentCtx context.Context, cid string) {
+	ins, err := b.cli.ContainerInspect(parentCtx, cid)
+	if err != nil {
+		log.Printf("inspect error: %s: %v", cid[:12], err)
+		return
+	}
+	if hasGlobalIgnore(ins.Config.Env, ins.Config.Labels) {
+		return
+	}
+
+	b.mu.Lock()
+	if _, ok := b.reg[cid]; ok {
+		b.mu.Unlock()
+		return
+	}
+	b.mu.Unlock()
+
+	ctx, cancel := context.WithCancel(b.rootCtx)
+	ip := firstHostIP()
+
+	// Step 1: explicit SERVICE_* env vars
+	svcs := parseEnv(ins.Config.Env, ip)
+
+	// Step 2: service.* labels
+	if len(svcs) == 0 {
+		if s := parseLabels(&ins, ip); s != nil {
+			svcs = append(svcs, s)
+		}
+	}
+
+	// Step 3: fallback → all ports
+	if len(svcs) == 0 {
+		svcs = buildDefaultServices(&ins, ip)
+	}
+
+	if len(svcs) == 0 {
+		cancel()
+		return
+	}
+
+	containerName := strings.TrimPrefix(ins.Name, "/")
+
+	for _, s := range svcs {
+		if s.Name == "" {
+			s.Name = containerName
+		}
+		if strings.HasPrefix(s.ID, "registrator:svc-") {
+			s.ID = fmt.Sprintf("registrator:%s:%d", containerName, s.Port)
+		}
+	}
+
+	b.mu.Lock()
+	b.reg[cid] = &regEntry{cancel: cancel}
+	b.mu.Unlock()
+
+	for _, s := range svcs {
+		validateTTL(s)
+		b.wg.Add(1)
+		go b.registerRetry(ctx, cid, s)
+	}
 }
 
 func (b *Bridge) registerRetry(ctx context.Context, cid string, s *Service) {
-    backoff := 2 * time.Second
-    for {
-        if err := b.be.Register(s); err == nil {
-            b.mu.Lock()
-            b.reg[cid] = append(b.reg[cid], s)
-            b.mu.Unlock()
-            log.Printf("✔ registered %s (%s)", s.ID, cid[:12])
-            if s.ttlValid {
-                d, _ := time.ParseDuration(s.TTL)
-                go b.ttlLoop(ctx, s, d/2)
-            }
-            return
-        } else {
-            log.Printf("registration failed for %s: %v (retry %s)", cid[:12], err, backoff)
-        }
-        select {
-        case <-time.After(backoff):
-            if backoff < time.Minute {
-                backoff *= 2
-            }
-        case <-ctx.Done():
-            return
-        }
-    }
+	defer b.wg.Done()
+
+	backoff := 1 * time.Second
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+
+		if err := b.be.Register(s); err == nil {
+			if ctx.Err() != nil {
+				_ = b.be.Deregister(s)
+				return
+			}
+
+			b.mu.Lock()
+			if entry := b.reg[cid]; entry != nil {
+				entry.mu.Lock()
+				entry.services = append(entry.services, s)
+				entry.mu.Unlock()
+			}
+			b.mu.Unlock()
+
+			log.Printf("✔ registered %s (%s)", s.ID, cid[:12])
+
+			if s.ttlValid {
+				d, _ := time.ParseDuration(s.TTL)
+				b.wg.Add(1)
+				go b.ttlLoop(ctx, s, maxDuration(d/3, time.Second))
+			}
+			return
+		} else {
+			log.Printf("registration failed for %s: %v (retry %s)", cid[:12], err, backoff)
+		}
+
+		select {
+		case <-time.After(backoff):
+			if backoff < 30*time.Second {
+				backoff *= 2
+			}
+		case <-ctx.Done():
+			return
+		}
+	}
 }
 
 func (b *Bridge) ttlLoop(ctx context.Context, s *Service, every time.Duration) {
-    if every < 5*time.Second {
-        every = 5 * time.Second
-    }
-    ticker := time.NewTicker(every)
-    defer ticker.Stop()
-    for {
-        select {
-        case <-ticker.C:
-            _ = b.be.PassTTL(s)
-        case <-ctx.Done():
-            return
-        }
-    }
+	defer b.wg.Done()
+
+	ticker := time.NewTicker(every)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			if err := b.be.PassTTL(s); err != nil && debug {
+				log.Printf("PassTTL error for %s: %v", s.ID, err)
+			}
+		case <-ctx.Done():
+			return
+		}
+	}
 }
+
+func maxDuration(a, b time.Duration) time.Duration {
+	if a > b {
+		return a
+	}
+	return b
+}
+
 
 func (b *Bridge) handleStop(cid string) {
-    b.mu.Lock()
-    services := b.reg[cid]
-    delete(b.reg, cid)
-    b.mu.Unlock()
-    for _, s := range services {
-        if err := b.be.Deregister(s); err != nil {
-            log.Println("deregister error:", err)
-        } else {
-            log.Printf("✖ deregistered %s (%s)", s.ID, cid[:12])
-        }
-    }
+	b.mu.Lock()
+	entry, ok := b.reg[cid]
+	if ok {
+		entry.cancel()          // stop ttl loops
+		delete(b.reg, cid)
+	}
+	b.mu.Unlock()
+
+	if !ok {
+		return
+	}
+
+	entry.mu.Lock()
+	services := append([]*Service(nil), entry.services...)
+	entry.mu.Unlock()
+
+	for _, s := range services {
+		// If DeregAfter is set, let Consul remove the service itself.
+		if s.DeregAfter != "" {
+			if debug {
+				log.Printf("⌛ %s: letting Consul deregister after %s", s.ID, s.DeregAfter)
+			}
+			continue
+		}
+
+		for i := 0; i < 3; i++ {
+			if err := b.be.Deregister(s); err != nil {
+				log.Printf("deregister error (%d/3): %v", i+1, err)
+				time.Sleep(time.Second)
+				continue
+			}
+			log.Printf("✖ deregistered %s (%s)", s.ID, cid[:12])
+			break
+		}
+	}
 }
 
-// get first exposed TCP port from image (host-network fallback)
-func getExposedPort(ins *types.ContainerJSON) int {
-    for ep := range ins.Config.ExposedPorts {
-        if p, err := strconv.Atoi(strings.Split(string(ep), "/")[0]); err == nil {
-            return p
-        }
-    }
-    return 0
-}
-
-// parseEnv: SERVICE_<PORT>_* parsing with port-level IGNORE
-func parseEnv(env []string, ip string) []*Service {
-    ports := map[string]map[string]string{}
-    for _, e := range env {
-        if !strings.HasPrefix(e, "SERVICE_") {
-            continue
-        }
-        kv := strings.SplitN(e[len("SERVICE_"):], "=", 2)
-        if len(kv) != 2 {
-            continue
-        }
-        parts := strings.SplitN(kv[0], "_", 2)
-        if len(parts) != 2 {
-            continue
-        }
-        p, f := parts[0], parts[1]
-        if _, ok := ports[p]; !ok {
-            ports[p] = map[string]string{}
-        }
-        ports[p][f] = kv[1]
-    }
-    var res []*Service
-    for p, m := range ports {
-        if m["IGNORE"] == "true" {
-            continue
-        }
-        port, err := strconv.Atoi(p)
-        if err != nil || port == 0 {
-            continue
-        }
-        name := firstNonEmpty(m["NAME"], "svc-"+p)
-        id := firstNonEmpty(m["ID"], fmt.Sprintf("registrator:%s:%s", name, p))
-        s := &Service{
-            ID:        id,
-            Name:      name,
-            IP:        ip,
-            Port:      port,
-            Tags:      splitCSV(m["TAGS"]),
-            HTTPPath:  m["CHECK_HTTP"],
-            TCP:       m["TCP"] == "true",
-            TTL:       m["TTL"],
-            Interval:  m["CHECK_INTERVAL"],
-            Timeout:   m["CHECK_TIMEOUT"],
-            DeregAfter: m["DEREG_AFTER"],
-        }
-        res = append(res, s)
-    }
-    return res
-}
-
-// parseLabels: single-port via labels with port-level and global IGNORE
-func parseLabels(ins *types.ContainerJSON, ip string) *Service {
-    l := ins.Config.Labels
-    if l["SERVICE_IGNORE"] == "true" {
-        return nil
-    }
-    port := 0
-    if p := l["SERVICE_PORT"]; p != "" {
-        port, _ = strconv.Atoi(p)
-    }
-    if port == 0 {
-        for _, b := range ins.NetworkSettings.Ports {
-            if len(b) > 0 {
-                port, _ = strconv.Atoi(b[0].HostPort)
-                if port != 0 {
-                    break
-                }
-            }
-        }
-    }
-    if port == 0 {
-        port = getExposedPort(ins)
-    }
-    if port == 0 || l[fmt.Sprintf("SERVICE_%d_IGNORE", port)] == "true" {
-        return nil
-    }
-    name := firstNonEmpty(l["SERVICE_NAME"], strings.TrimPrefix(ins.Name, "/"))
-    id := firstNonEmpty(l["SERVICE_ID"], fmt.Sprintf("registrator:%s:%d", name, port))
-    return &Service{ID: id, Name: name, IP: ip, Port: port,
-        Tags: splitCSV(l["SERVICE_TAGS"]),
-        HTTPPath: l["SERVICE_CHECK_HTTP"],
-        TCP:       l["SERVICE_TCP"] == "true",
-        TTL:       l["SERVICE_TTL"],
-        Interval:  l["SERVICE_CHECK_INTERVAL"],
-        Timeout:   l["SERVICE_CHECK_TIMEOUT"],
-        DeregAfter: l["SERVICE_DEREG_AFTER"],
-    }
-}
-
-// validateTTL sets ttlValid if TTL>0
-func validateTTL(s *Service) {
-    if s.TTL == "" {
-        return
-    }
-    if d, err := time.ParseDuration(s.TTL); err == nil && d > 0 {
-        s.ttlValid = true
-    } else {
-        log.Printf("invalid TTL for %s — ignored", s.ID)
-        s.TTL = ""
-    }
-}
-
-func splitCSV(s string) []string {
-    if s == "" {
-        return nil
-    }
-    parts := strings.Split(s, ",")
-    var out []string
-    for _, p := range parts {
-        if t := strings.TrimSpace(p); t != "" {
-            out = append(out, t)
-        }
-    }
-    return out
-}
+// ----------------------------------------------------------------------
+// Helpers
+// ----------------------------------------------------------------------
 
 func firstNonEmpty(a, b string) string {
-    if a != "" {
-        return a
-    }
-    return b
+	if a != "" {
+		return a
+	}
+	return b
 }
 
 func firstHostIP() string {
-    if env := os.Getenv("HOST_IP"); env != "" {
-        return env
-    }
-    ifaces, _ := net.Interfaces()
-    for _, iface := range ifaces {
-        if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
-            continue
-        }
-        addrs, _ := iface.Addrs()
-        for _, a := range addrs {
-            if ipn, ok := a.(*net.IPNet); ok && ipn.IP.To4() != nil {
-                return ipn.IP.String()
-            }
-        }
-    }
-    return "127.0.0.1"
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return "127.0.0.1"
+	}
+	for _, iface := range ifaces {
+		if iface.Flags&(net.FlagUp|net.FlagLoopback) != net.FlagUp {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, addr := range addrs {
+			var ip net.IP
+			switch v := addr.(type) {
+			case *net.IPNet:
+				ip = v.IP
+			case *net.IPAddr:
+				ip = v.IP
+			}
+			if ip == nil || ip.IsLoopback() || ip.To4() == nil {
+				continue
+			}
+			return ip.String()
+		}
+	}
+	return "127.0.0.1"
 }
 
+// buildDefaultServices registers every port when no SERVICE_* / labels present.
+func buildDefaultServices(ins *types.ContainerJSON, ip string) []*Service {
+	var res []*Service
+	cname := strings.TrimPrefix(ins.Name, "/")
+
+	// host network — use container's exposed ports directly
+	if ins.HostConfig.NetworkMode == "host" {
+		for p := range ins.Config.ExposedPorts {
+			port := int(p.Int())
+			res = append(res, &Service{
+				ID:   fmt.Sprintf("registrator:%s:%d", cname, port),
+				Name: cname,
+				Port: port,
+				IP:   ip,
+			})
+		}
+		return res
+	}
+
+	// bridge / user networks — prefer published host ports
+	if len(ins.NetworkSettings.Ports) > 0 {
+		for _, binds := range ins.NetworkSettings.Ports {
+			if len(binds) == 0 {
+				continue
+			}
+			hostPort, _ := strconv.Atoi(binds[0].HostPort)
+			res = append(res, &Service{
+				ID:   fmt.Sprintf("registrator:%s:%d", cname, hostPort),
+				Name: cname,
+				Port: hostPort,
+				IP:   ip,
+			})
+		}
+	} else { // fallback: exposed ports
+		for p := range ins.Config.ExposedPorts {
+			port := int(p.Int())
+			res = append(res, &Service{
+				ID:   fmt.Sprintf("registrator:%s:%d", cname, port),
+				Name: cname,
+				Port: port,
+				IP:   ip,
+			})
+		}
+	}
+	return res
+}
+
+// parseEnv converts SERVICE_* env vars into Service instances.
+func parseEnv(env []string, ip string) []*Service {
+	svcMap := map[string]*Service{}
+
+	for _, e := range env {
+		if !strings.HasPrefix(e, "SERVICE_") {
+			continue
+		}
+		kv := strings.SplitN(e, "=", 2)
+		if len(kv) != 2 {
+			continue
+		}
+		key, val := kv[0], kv[1]
+		parts := strings.Split(key, "_")
+		if len(parts) < 3 {
+			continue
+		}
+		portStr := parts[1]
+		if _, err := strconv.Atoi(portStr); err != nil {
+			continue
+		}
+		field := strings.Join(parts[2:], "_")
+		if strings.HasPrefix(field, "CHECK_") {
+			field = strings.TrimPrefix(field, "CHECK_")
+		}
+
+		svc := svcMap[portStr]
+		if svc == nil {
+			p, _ := strconv.Atoi(portStr)
+			svc = &Service{
+				ID:   fmt.Sprintf("registrator:svc-%s", portStr),
+				Port: p,
+				IP:   ip,
+			}
+			svcMap[portStr] = svc
+		}
+
+		switch field {
+		case "NAME":
+			svc.Name = val
+		case "ID":
+			svc.ID = val
+		case "TAGS":
+			svc.Tags = strings.Split(val, ",")
+		case "HTTP", "PATH":
+			svc.HTTPPath = val
+		case "TCP":
+			svc.TCPCheck = strings.ToLower(val) == "true"
+		case "TTL":
+			svc.TTL = val
+		case "INTERVAL":
+			svc.Interval = val
+		case "TIMEOUT":
+			svc.Timeout = val
+		case "DEREG_AFTER", "DEREG":
+			svc.DeregAfter = val
+		}
+	}
+
+	var res []*Service
+	for _, s := range svcMap {
+		res = append(res, s)
+	}
+	return res
+}
+
+func parseLabels(ins *types.ContainerJSON, ip string) *Service {
+	lbl := ins.Config.Labels
+	portStr := lbl["service.port"]
+	if portStr == "" {
+		return nil
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		return nil
+	}
+
+	cname := strings.TrimPrefix(ins.Name, "/")
+
+	s := &Service{
+		ID:   firstNonEmpty(lbl["service.id"], fmt.Sprintf("registrator:%s:%d", cname, port)),
+		Name: firstNonEmpty(lbl["service.name"], cname),
+		Port: port,
+		IP:   ip,
+	}
+	if tags := lbl["service.tags"]; tags != "" {
+		s.Tags = strings.Split(tags, ",")
+	}
+	s.HTTPPath = firstNonEmpty(lbl["service.check_http"], lbl["service.http"])
+	s.Interval = firstNonEmpty(lbl["service.check_interval"], lbl["service.interval"])
+	s.Timeout = firstNonEmpty(lbl["service.check_timeout"], lbl["service.timeout"])
+	s.TTL = firstNonEmpty(lbl["service.check_ttl"], lbl["service.ttl"])
+	s.DeregAfter = firstNonEmpty(lbl["service.dereg_after"], lbl["service.dereg"])
+	if tcp := lbl["service.tcp"]; tcp == "true" {
+		s.TCPCheck = true
+	}
+	return s
+}
+
+func validateTTL(s *Service) {
+	if s.TTL == "" {
+		return
+	}
+	ttlDur, err := time.ParseDuration(s.TTL)
+	if err != nil || ttlDur <= 0 {
+		log.Printf("invalid TTL for %s — ignored", s.ID)
+		s.TTL = ""
+		s.DeregAfter = ""
+		return
+	}
+
+	if s.DeregAfter != "" {
+		deregDur, err := time.ParseDuration(s.DeregAfter)
+		if err != nil || deregDur <= ttlDur {
+			s.DeregAfter = (ttlDur * 2).String()
+			log.Printf("DeregisterAfter corrected for %s to %s", s.ID, s.DeregAfter)
+		}
+	} else {
+		s.DeregAfter = (ttlDur * 2).String()
+		log.Printf("DeregisterAfter set for %s to %s", s.ID, s.DeregAfter)
+	}
+	s.ttlValid = true
+}
+
+// ----------------------------------------------------------------------
+// main
+// ----------------------------------------------------------------------
+
 func main() {
-    be := newConsulBackend(os.Getenv("CONSUL_ADDR"))
-    br, err := newBridge(be)
-    if err != nil {
-        log.Fatal(err)
-    }
-    ctx, cancel := context.WithCancel(context.Background())
-    defer cancel()
-    if err := br.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
-        log.Fatal(err)
-    }
+	insecure := flag.Bool("insecure", os.Getenv("CONSUL_SKIP_VERIFY") == "1", "Skip TLS certificate verification")
+	consulAddr := flag.String("consul", os.Getenv("CONSUL_ADDR"), "Consul address, e.g. https://consul:8500")
+	flag.Parse()
+
+	be := newConsulBackend(*consulAddr, *insecure)
+	br, err := newBridge(be)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer func() {
+		if err := br.Close(); err != nil {
+			log.Printf("error closing Docker client: %v", err)
+		}
+	}()
+
+	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer cancel()
+
+	if err := br.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+		log.Fatal(err)
+	}
 }
