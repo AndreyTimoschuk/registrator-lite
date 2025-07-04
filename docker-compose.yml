@@ -1,0 +1,83 @@
+
+## This is a test docker-compose file for testing
+## Consul service discovery with Registrator.
+services:
+  consul:
+    image: hashicorp/consul:1.21
+    container_name: consul
+    command: agent -dev -client=0.0.0.0 -log-level=INFO
+    ports:
+      - "8500:8500"   # UI → consul http://localhost:8500
+
+  registrator:
+    build:
+      context: ./registrator
+    network_mode: host
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - CONSUL_ADDR=127.0.0.1:8500
+    depends_on:
+      - consul
+
+  host-service:
+    image: hashicorp/http-echo:1.0.0
+    network_mode: host
+    command: -text="host-service" -listen=:8081
+    environment:
+      # basic HTTP check
+      - SERVICE_8081_NAME=host-http
+      - SERVICE_8081_TAGS=type=infra,prometheus=true
+      - SERVICE_8081_CHECK_HTTP=/health
+      # advanced tuning
+      - SERVICE_8081_CHECK_INTERVAL=5s
+      # - SERVICE_8081_CHECK_TIMEOUT=1s
+      - SERVICE_8081_DEREG_AFTER=30s
+      # TTL check (overrides HTTP)
+      # - SERVICE_8081_TTL=20s
+      # custom ID
+      - SERVICE_8081_ID=custom-host-id
+
+  bridge-http:
+    image: hashicorp/http-echo:1.0.0
+    ports:
+      - "8082:80"
+    command: -text="bridge-service" -listen=:80
+    environment:
+      - SERVICE_8082_NAME=bridge-http
+      - SERVICE_8082_TAGS=bridge
+      - SERVICE_8082_CHECK_HTTP=/
+      # - SERVICE_8082_TTL=15s
+      - SERVICE_8082_ID=custom-bridge-id
+
+  bridge-tcp:
+    image: nginx:latest
+    ports:
+      - "8083:80"
+    environment:
+      - SERVICE_8083_NAME=bridge-tcp
+      - SERVICE_8083_TCP=true
+      - SERVICE_8083_TAGS=tcp
+      - SERVICE_8083_DEREG_AFTER=45s
+
+  app-pub-dereg:
+    image: hashicorp/http-echo:1.0.0
+    command: -text="bridge-service" -listen=:8084
+    ports:
+      - "8084:8084"
+    environment:
+      SERVICE_8084_NAME:       pub-dereg
+      SERVICE_8084_CHECK_HTTP: /
+      SERVICE_8084_DEREG_AFTER: 45s
+      SERVICE_8084_TAGS:       custom-dereg
+
+  app-pub-custom-id:
+    image: hashicorp/http-echo:1.0.0
+    container_name: app-pub-custom-id-8085
+    command: -text="bridge-service" -listen=:8085
+    ports:
+      - "8085:8085"
+    environment:
+      SERVICE_8085_CHECK_HTTP: /status
+      SERVICE_8085_TAGS:      id-test
+      # SERVICE_IGNORE: true
