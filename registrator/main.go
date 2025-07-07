@@ -570,8 +570,6 @@ func firstHostIP() string {
 }
 
 // buildDefaultServices registers detected ports when no SERVICE_* / labels present.
-// If -all-ports=false (default) only the first port is registered.
-// buildDefaultServices registers detected ports when no SERVICE_* / labels present.
 // If -all-ports flag is false *and* REGISTER_ALL_PORTS env var is absent/false,
 // only the first port is registered.
 func buildDefaultServices(ins *types.ContainerJSON, ip string) []*Service {
@@ -658,6 +656,12 @@ func parseEnv(env []string, ip string) []*Service {
 			field = strings.TrimPrefix(field, "CHECK_")
 		}
 
+		// IGNORE=true|1 => drop the port entirely
+		if field == "IGNORE" && (strings.ToLower(val) == "true" || val == "1") {
+			delete(svcMap, portStr)
+			continue
+		}
+
 		svc := svcMap[portStr]
 		if svc == nil {
 			p, _ := strconv.Atoi(portStr)
@@ -706,6 +710,12 @@ func parseLabels(ins *types.ContainerJSON, ip string) *Service {
 	}
 	port, err := strconv.Atoi(portStr)
 	if err != nil {
+		return nil
+	}
+
+	// per-port ignore
+	ignoreKey := fmt.Sprintf("service.%s.ignore", portStr)
+	if v := strings.ToLower(lbl[ignoreKey]); v == "true" || v == "1" {
 		return nil
 	}
 
