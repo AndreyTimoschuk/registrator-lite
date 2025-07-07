@@ -31,6 +31,13 @@ import (
 
 var debug = os.Getenv("DEBUG") == "1"
 
+// allPorts controls whether we register every detected port or just the first one.
+var allPorts = flag.Bool(
+	"all-ports",
+	false,
+	"register every exposed/published port instead of just the first one",
+)
+
 func init() { rand.Seed(time.Now().UnixNano()) }
 
 // ----------------------------------------------------------------------
@@ -380,7 +387,7 @@ func (b *Bridge) handleStart(parentCtx context.Context, cid string) {
 		}
 	}
 
-	// Step 3: fallback → all ports
+	// Step 3: fallback → detected ports
 	if len(svcs) == 0 {
 		svcs = buildDefaultServices(&ins, ip)
 	}
@@ -483,12 +490,11 @@ func maxDuration(a, b time.Duration) time.Duration {
 	return b
 }
 
-
 func (b *Bridge) handleStop(cid string) {
 	b.mu.Lock()
 	entry, ok := b.reg[cid]
 	if ok {
-		entry.cancel()          // stop ttl loops
+		entry.cancel() // stop ttl loops
 		delete(b.reg, cid)
 	}
 	b.mu.Unlock()
@@ -563,48 +569,64 @@ func firstHostIP() string {
 	return "127.0.0.1"
 }
 
-// buildDefaultServices registers every port when no SERVICE_* / labels present.
+// buildDefaultServices registers detected ports when no SERVICE_* / labels present.
+// If -all-ports=false (default) only the first port is registered.
+// buildDefaultServices registers detected ports when no SERVICE_* / labels present.
+// If -all-ports flag is false *and* REGISTER_ALL_PORTS env var is absent/false,
+// only the first port is registered.
 func buildDefaultServices(ins *types.ContainerJSON, ip string) []*Service {
 	var res []*Service
 	cname := strings.TrimPrefix(ins.Name, "/")
 
-	// host network — use container's exposed ports directly
+	// envAllPorts becomes true when REGISTER_ALL_PORTS=true|1 is present.
+	envAllPorts := false
+	for _, e := range ins.Config.Env {
+		if strings.HasPrefix(e, "REGISTER_ALL_PORTS=") {
+			v := strings.ToLower(strings.TrimPrefix(e, "REGISTER_ALL_PORTS="))
+			envAllPorts = v == "true" || v == "1"
+			break
+		}
+	}
+	all := *allPorts || envAllPorts
+
+	add := func(port int) {
+		res = append(res, &Service{
+			ID:   fmt.Sprintf("registrator:%s:%d", cname, port),
+			Name: cname,
+			Port: port,
+			IP:   ip,
+		})
+	}
+
+	// host network – use container's exposed ports directly
 	if ins.HostConfig.NetworkMode == "host" {
 		for p := range ins.Config.ExposedPorts {
-			port := int(p.Int())
-			res = append(res, &Service{
-				ID:   fmt.Sprintf("registrator:%s:%d", cname, port),
-				Name: cname,
-				Port: port,
-				IP:   ip,
-			})
+			add(int(p.Int()))
+			if !all {
+				break
+			}
 		}
 		return res
 	}
 
-	// bridge / user networks — prefer published host ports
+	// bridge / user networks – prefer published host ports
 	if len(ins.NetworkSettings.Ports) > 0 {
 		for _, binds := range ins.NetworkSettings.Ports {
 			if len(binds) == 0 {
 				continue
 			}
 			hostPort, _ := strconv.Atoi(binds[0].HostPort)
-			res = append(res, &Service{
-				ID:   fmt.Sprintf("registrator:%s:%d", cname, hostPort),
-				Name: cname,
-				Port: hostPort,
-				IP:   ip,
-			})
+			add(hostPort)
+			if !all {
+				return res
+			}
 		}
 	} else { // fallback: exposed ports
 		for p := range ins.Config.ExposedPorts {
-			port := int(p.Int())
-			res = append(res, &Service{
-				ID:   fmt.Sprintf("registrator:%s:%d", cname, port),
-				Name: cname,
-				Port: port,
-				IP:   ip,
-			})
+			add(int(p.Int()))
+			if !all {
+				break
+			}
 		}
 	}
 	return res
