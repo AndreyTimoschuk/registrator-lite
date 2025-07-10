@@ -852,26 +852,35 @@ func containerIP(ins *types.ContainerJSON) string {
 
 // firstHostIP finds the first non-loopback IPv4 of the host.
 func firstHostIP() string {
-    ifs, _ := net.Interfaces()
-    for _, iface := range ifs {
-        if iface.Flags&(net.FlagUp|net.FlagLoopback) != net.FlagUp {
-            continue
-        }
-        addrs, _ := iface.Addrs()
-        for _, a := range addrs {
-            var ip net.IP
-            switch v := a.(type) {
-            case *net.IPNet:
-                ip = v.IP
-            case *net.IPAddr:
-                ip = v.IP
-            }
-            if ip != nil && !ip.IsLoopback() && ip.To4() != nil {
-                return ip.String()
-            }
-        }
-    }
-    return "127.0.0.1"
+	ifs, _ := net.Interfaces()
+	for _, iface := range ifs {
+
+		if iface.Flags&(net.FlagUp|net.FlagLoopback) != net.FlagUp {
+			continue
+		}
+
+		if iface.Name == "docker0" ||
+			strings.HasPrefix(iface.Name, "br-") ||
+			strings.HasPrefix(iface.Name, "veth") {
+			continue
+		}
+
+		addrs, _ := iface.Addrs()
+		for _, a := range addrs {
+			var ip net.IP
+			switch v := a.(type) {
+			case *net.IPNet:
+				ip = v.IP
+			case *net.IPAddr:
+				ip = v.IP
+			}
+			if ip != nil && !ip.IsLoopback() && ip.To4() != nil {
+				return ip.String()
+			}
+		}
+	}
+
+	return "127.0.0.1"
 }
 
 // ----------------------------- main -----------------------
