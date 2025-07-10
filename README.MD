@@ -5,70 +5,91 @@ It watches your Docker containers and **adds** or **removes** their service data
 
 ---
 
-## 1. Short description
+## 1 · What it does
 
-* Runs in its own Docker container.  
-* Watches Docker events.  
-* When a container starts, it makes a **service** in Consul.  
-* When a container stops, it deletes the service.  
-* Works with normal bridge network and with `network_mode: host`.  
-* **By default registers only the first detected port; use `-all-ports`
-  flag or `REGISTER_ALL_PORTS=true` to register *all* ports.**
-
----
-
-## 2. Main features
-
-| Feature | Simple words |
-|---------|--------------|
-| **Auto register / deregister** | Adds and removes services without human work. |
-| **HTTP, TCP or TTL health checks** | You can check a URL, open a TCP port, or send TTL heartbeats. |
-| **Many ports per container** | Use `SERVICE_<PORT>_*` to set many services in one container. |
-| **Selective port registration** | First port only by default, all ports when `-all-ports` or `REGISTER_ALL_PORTS=true`. |
-| **Per-port ignore via env/label** | Skip any port with `SERVICE_<PORT>_IGNORE=true` or label `service.<port>.ignore=true`. |
-| **Host-network support** | If the container uses host mode, the program reads the first `EXPOSE` port from the image. |
-| **Container-name fallback** | If you do not set a name, the service name becomes the container name. |
-| **Low memory** | Written in Go, one static binary. |
+| Action | When it happens |
+|--------|-----------------|
+| **Register** service in Consul | When a container fires a `start` event (or is spotted during a periodic rescan). |
+| **Keep health-checks** up | Optional HTTP / TCP or TTL checks per port. |
+| **Send TTL heart-beats** | When a port is configured with `SERVICE_<PORT>_TTL`. |
+| **Deregister** service | As soon as the container stops, or after Consul’s own `DEREG_AFTER`. |
+| **Cleanup stale entries** | When `CLEANUP=true` — removes records whose container (CID tag) no longer exists on this host. |
+| **Periodic resync** | Full `docker ps` + cleanup every `RESYNC` seconds (default 60 s, `0` = disabled). |
 
 ---
 
-## 3. ENV and label settings
+## 2 · Key features & quirks
 
-You can set them as **environment variables** or **Docker labels**.  
-Replace `<PORT>` with the real port number (example: `8080`).
+| Feature | Details & tips |
+|---------|----------------|
+| **Multiple ports** | Describe each port with `SERVICE_<PORT>_*`. By default only the **first** port is registered; use `-all-ports` or `REGISTER_ALL_PORTS=true` to include the rest. |
+| **Smart service names** | *If* you: **(a)** do **not** set `SERVICE_<PORT>_NAME`, **(b)** do **not** set `container_name`, and **(c)** run under Compose, the service name falls back to the pure Compose *service* (`app`), **not** the long auto-name (`project_app_1`). <br>Give a real `container_name:` and it wins. |
+| **Internal mode** | `-internal` / `INTERNAL=true` ⇒ service is bound to the **container’s own IP** (not the host) and **all active checks are disabled** (makes sense in pure overlay networks or when Envoy / sidecar does its own health). |
+| **Automatic meta-tags** | Unless disabled, every service receives<br>`managed-by=registrator-lite`, `node:<hostname>`, `cid:<12chars>`.  These guarantee cleanup never touches anything it didn’t create. |
+| **Tag toggle** | Global → `-auto-tags=false` or `AUTO_TAGS=false`.<br>Per-container → `SERVICE_AUTO_TAGS=false`. |
+| **Graceful Consul cleanup** | If tags are off the service is *invisible* to the cleanup routine — handy for hand-crafted or foreign entries. |
+| **Minimum `DEREG_AFTER`** | Consul enforces ≥ 1 m. If you set `30s`, Consul accepts it but logs a warning and coerces it to 1 m. Registrator just passes your value through. |
+| **Low footprint** | Single static binary; image is < 10 MB. |
 
-| Name / Pattern | Value | Meaning |
-|----------------|-------|---------|
-| `SERVICE_IGNORE` | `true` | Skip the whole container. |
-| `SERVICE_<PORT>_IGNORE`<br>`service.<port>.ignore` | `true` | Skip only this port. |
-| `SERVICE_<PORT>_NAME` | text | Service name in Consul. |
-| `SERVICE_<PORT>_ID` | text | Fixed ID (else auto). |
-| `SERVICE_<PORT>_TAGS` | `tag1,tag2` | Comma list of tags. |
-| `SERVICE_<PORT>_CHECK_HTTP` | `/path` | HTTP check path. |
-| `SERVICE_<PORT>_TCP` | `true` | Use TCP check, not HTTP. |
-| `SERVICE_<PORT>_TTL` | `15s` | TTL check time. |
-| `SERVICE_<PORT>_CHECK_INTERVAL` | `10s` | Time between HTTP/TCP checks. |
-| `SERVICE_<PORT>_CHECK_TIMEOUT` | `2s` | Timeout for HTTP/TCP checks. |
-| `SERVICE_<PORT>_DEREG_AFTER` | `1m` | Remove service after this time in “critical” state. |
-| `SERVICE_<PORT>` | *(only as label)* port number | Shortcut when you only need one port. |
+---
 
-### Global variables for Registrator container
+## 3 · Per-port variables / labels
 
-| Name | Default | Meaning |
-|------|---------|---------|
-| `CONSUL_ADDR` | `consul:8500` | Where to send API calls. |
-| `HOST_IP` | auto | Fixed host IP if auto guess is wrong. |
-| `REGISTER_ALL_PORTS` | unset | `true`/`1` → register every port in the container. |
-| `DEBUG` | unset | Set to `1` to print HTTP calls. |
-| `CONSUL_SKIP_VERIFY` | `1` | Skip TLS cert check (same as flag `--insecure`). |
+Replace `<PORT>` with the number (e.g. `8080`).
 
-### CLI flags
+| Key | Example | Meaning |
+|-----|---------|---------|
+| `SERVICE_<PORT>_IGNORE` | `true` | Skip this port completely. |
+| `SERVICE_<PORT>_NAME` | `web-v2` | Explicit service name. |
+| `SERVICE_<PORT>_ID` | `web-v2-east` | Fixed Consul ID (else auto). |
+| `SERVICE_<PORT>_TAGS` | `foo,bar` | Comma list of Consul tags. |
+| `SERVICE_<PORT>_TCP` | `true` | Use TCP health check instead of HTTP. |
+| `SERVICE_<PORT>_CHECK_HTTP` | `/health` | Relative URL for HTTP check. |
+| `SERVICE_<PORT>_TTL` | `30s` | TTL style check; Registrator sends keep-alive at ¹⁄₃ TTL. |
+| `SERVICE_<PORT>_CHECK_INTERVAL` | `5s` | HTTP/TCP check interval. |
+| `SERVICE_<PORT>_CHECK_TIMEOUT` | `2s` | HTTP/TCP timeout. |
+| `SERVICE_<PORT>_DEREG_AFTER` | `2m` | Let Consul auto-remove when critical that long. |
+| Label shortcut: `service.<port>` | `8080` | Minimal case: only wrap this port; everything else defaults. |
 
-| Flag | Default | Meaning |
-|------|---------|---------|
-| `-all-ports` | `false` | Register every exposed / published port instead of just the first one. |
-| `-consul` | see `CONSUL_ADDR` | Consul address. |
-| `-insecure` | see `CONSUL_SKIP_VERIFY` | Skip TLS certificate verification. |
+---
+
+## 4 · Container-level variables / labels
+
+| Key | Default | Purpose |
+|-----|---------|---------|
+| `SERVICE_IGNORE` | — | Skip **entire** container. |
+| `SERVICE_AUTO_TAGS` | inherit global | `false` → do not add the `managed-by/node/cid` trio for this container only. |
+| `INTERNAL` | inherit global | Force internal mode for this one container. |
+
+---
+
+## 5 · Global environment / CLI flags
+
+| Env / Flag | Default | Description |
+|------------|---------|-------------|
+| `CONSUL_ADDR`, `-consul` | `consul:8500` | Consul HTTP(S) endpoint. |
+| `CONSUL_HTTP_TOKEN` | — | ACL token if needed. |
+| `CONSUL_SKIP_VERIFY`, `-insecure` | `0` | `1` or flag → skip TLS cert verify. |
+| `REGISTER_ALL_PORTS`, `-all-ports` | `false` | Register every port instead of first. |
+| `INTERNAL`, `-internal` | `false` | Container IPs, no checks. |
+| `AUTO_TAGS`, `-auto-tags` | `true` | Add `managed-by/node/cid` tags. |
+| `CLEANUP`, `-cleanup` | `false` | Enable stale-service cleanup loop. |
+| `RESYNC`, `-resync` | `60s` | Full docker-ps refresh; `0` disables. |
+| `TTL`, `-ttl` | `0` | Default TTL if a port didn’t specify one. |
+| `DEBUG` | `0` | `1` → verbose HTTP/Consul logs. |
+
+---
+
+## 6 · How cleanup works (safe & isolated)
+
+1. Reads `/v1/agent/services` from local Consul.  
+2. Keeps only services whose **tags contain all** of:  
+   `managed-by=registrator-lite`, `node:<this-host>`, `cid:<cid>`.  
+3. If `<cid>` is **not** in `docker ps`, deregisters the service.  
+4. Anything without those tags (handmade services, other hosts,
+   other tools) is left untouched.
+
+Disable auto-tags → service is never considered by cleanup.
 
 ---
 
@@ -76,7 +97,7 @@ Replace `<PORT>` with the real port number (example: `8080`).
 
 0. You need to have the Consul agent on the system as a systemd unit or container.
 1. Build new version if neccessary.
-2. Run docker container with registrator:
+2. Or run docker container with registrator:
 
 ```sh
 docker run -d --name registrator-lite \
