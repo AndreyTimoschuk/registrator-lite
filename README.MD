@@ -77,6 +77,7 @@ Replace `<PORT>` with the number (e.g. `8080`).
 | `RESYNC`, `-resync` | `60s` | Full docker-ps refresh; `0` disables. |
 | `TTL`, `-ttl` | `0` | Default TTL if a port didn’t specify one. |
 | `DEBUG` | `0` | `1` → verbose HTTP/Consul logs. |
+| `HOST_IP` | auto | Fixed host IP if auto guess is wrong. |
 
 ---
 

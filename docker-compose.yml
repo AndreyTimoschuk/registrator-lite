@@ -27,6 +27,7 @@ services:
       RESYNC: 30s
       CLEANUP: true
       DEBUG: 1
+      # HOST_IP: 1.1.1.1
     depends_on:
       - consul
 
